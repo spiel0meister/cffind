@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 #include <assert.h>
 
 #include "da.h"
@@ -10,7 +11,7 @@
 #include "tree-sitter/lib/include/tree_sitter/api.h"
 #include "tree-sitter-c/bindings/c/tree-sitter-c.h"
 
-#define FDEF_QUERY "(declaration type: (_) @return_type declarator: (function_declarator declarator: (_) @name parameters: (parameter_list ((parameter_declaration type: (_) @param_type) . (\",\" . (parameter_declaration type: (_) @param_type))*)?))) @def"
+#define FDEF_QUERY "(declaration type: (_) @return_type declarator: (function_declarator parameters: (parameter_list ((parameter_declaration type: (_) @param_type) . (\",\" . (parameter_declaration type: (_) @param_type))*)?))) @def"
 
 typedef struct {
     const char* start;
@@ -24,7 +25,9 @@ typedef struct {
 }ParamTypes;
 
 typedef struct {
-    StringView name;
+    const char* file;
+    size_t line;
+
     StringView return_type;
     StringView def;
     ParamTypes param_types;
@@ -36,14 +39,15 @@ typedef struct {
     size_t capacity;
 }FuncDefs;
 
-void get_defs(FuncDefs* defs, const char* source) {
+bool get_defs(FuncDefs* defs, const char* file, const char* source) {
     size_t source_len = strlen(source);
 
     TSParser* parser = ts_parser_new();
     assert(parser != NULL);
-    ts_parser_set_language(parser, tree_sitter_c());
+    assert(ts_parser_set_language(parser, tree_sitter_c()));
 
     TSTree* tree = ts_parser_parse_string(parser, NULL, source, source_len);
+    assert(tree != NULL);
     TSNode root = ts_tree_root_node(tree);
 
     uint32_t error_offset;
@@ -56,7 +60,7 @@ void get_defs(FuncDefs* defs, const char* source) {
     ts_query_cursor_exec(cursor, query, root);
     TSQueryMatch match;
     while (ts_query_cursor_next_match(cursor, &match)) {
-        FuncDef def = {0};
+        FuncDef def = { .file = file };
         for (size_t i = 0; i < match.capture_count; ++i) {
             const TSQueryCapture* capture = &match.captures[i];
             uint32_t len;
@@ -69,11 +73,11 @@ void get_defs(FuncDefs* defs, const char* source) {
             if (strcmp(capture_name, "param_type") == 0) {
                 da_append(&def.param_types, sv);
             } else if (strcmp(capture_name, "def") == 0) {
+                TSPoint point = ts_node_start_point(capture->node);
                 def.def = sv;
+                def.line = point.row;
             } else if (strcmp(capture_name, "return_type") == 0) {
                 def.return_type = sv;
-            } else if (strcmp(capture_name, "name") == 0) {
-                def.name = sv;
             } else {
                 assert(0);
             }
@@ -86,6 +90,8 @@ void get_defs(FuncDefs* defs, const char* source) {
     ts_query_cursor_delete(cursor);
     ts_query_delete(query);
     ts_parser_delete(parser);
+
+    return true;
 }
 
 FuncDef parse_query(const char* query_source) {
@@ -156,19 +162,30 @@ FuncDef parse_query(const char* query_source) {
     return def;
 }
 
+#ifdef DEBUG
+static print_cache(size_t* cache, size_t an, size_t bn) {
+    for (size_t i = 1; i <= an; ++i) {
+        for (size_t j = 1; j <= bn; ++j) {
+            printf("%ld ", CACHE_AT(i, j));
+        }
+        printf("\n");
+    }
+}
+#endif // DEBUG
+
 size_t levenshtein(const char* a, size_t an, const char* b, size_t bn) {
     if (an == 0) return bn;
     if (bn == 0) return an;
 
-    size_t* cache = malloc(sizeof(size_t) * (an + 1) * (bn + 1));
+    size_t* cache = calloc((an + 1) * (bn + 1), sizeof(size_t));
 #define CACHE_AT(i, j) cache[(i) * bn + (j)]
 
     for (size_t j = 0; j <= bn; ++j) {
-        cache[0 * bn + j] = j;
+        CACHE_AT(0, j) = j;
     }
 
     for (size_t i = 0; i <= an; ++i) {
-        cache[i * bn + 0] = i;
+        CACHE_AT(i, 0) = i;
     }
 
     for (size_t i = 1; i <= an; ++i) {
@@ -183,7 +200,6 @@ size_t levenshtein(const char* a, size_t an, const char* b, size_t bn) {
     size_t value = cache[an * bn + bn];
     free(cache);
 
-    // printf("'%.*s' vs '%.*s' = %ld\n", (int)an, a, (int)bn, b, value);
     return value;
 }
 
@@ -199,6 +215,7 @@ char* read_entire_file(const char* path) {
     fread(out, 1, len, f);
     out[len] = 0;
 
+    fclose(f);
     return out;
 }
 
@@ -255,6 +272,12 @@ const char* pop_argv(int* argc, char*** argv) {
     return arg;
 }
 
+void usage(FILE* sink, const char* program) {
+    fprintf(sink, "Usage: %s <QUERY> <FILE...>\n", program);
+    fprintf(sink, "Flags:\n");
+    fprintf(sink, "    --all - Print ALL found defenitions, not top 15\n");
+}
+
 int main(int argc, char* argv[argc]) {
     const char* program = pop_argv(&argc, &argv);
 
@@ -266,8 +289,12 @@ int main(int argc, char* argv[argc]) {
         const char* arg = pop_argv(&argc, &argv);
         if (arg[0] == '-') {
             if (strcmp(arg, "--all") == 0) print_all = true;
-            else {
+            else if (strcmp(arg, "-h") == 0) {
+                usage(stdout, program);
+                exit(0);
+            } else {
                 fprintf(stderr, "Unknown flag: %s\n", arg);
+                usage(stderr, program);
                 exit(1);
             }
 
@@ -281,13 +308,30 @@ int main(int argc, char* argv[argc]) {
         }
     }
 
+    if (source_files.count == 0) {
+        fprintf(stderr, "No source files provided\n");
+        usage(stderr, program);
+        exit(1);
+    }
+
+    if (query == NULL) {
+        fprintf(stderr, "No query provided\n");
+        usage(stderr, program);
+        exit(1);
+    }
+
     FuncDefs defs = {0};
     FuncDef query_compiled = parse_query(query); 
 
     da_foreach(&source_files, char*, source_file) {
         char* source = read_entire_file(*source_file);
 
-        get_defs(&defs, source);
+        if (source == NULL) {
+            fprintf(stderr, "Error loading %s: %s\n", *source_file, strerror(errno));
+            continue;
+        }
+
+        get_defs(&defs, *source_file, source);
     }
 
     FuncDefDists def_dists = {0};
@@ -300,7 +344,7 @@ int main(int argc, char* argv[argc]) {
     qsort(def_dists.items, def_dists.count, sizeof(def_dists.items[0]), compare_funcdefdist);
 
     for (size_t i = 0; (i < 15 || print_all) && i < def_dists.count; ++i) {
-        printf("Found: '%.*s' (levenshtein distance: %ld)\n", (int)def_dists.items[i].def->def.len, def_dists.items[i].def->def.start, def_dists.items[i].dist);
+        printf("Found: %s:%ld: '%.*s'\n", def_dists.items[i].def->file, def_dists.items[i].def->line, (int)def_dists.items[i].def->def.len, def_dists.items[i].def->def.start);
     }
 
     da_free(&def_dists);
