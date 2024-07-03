@@ -18,6 +18,9 @@ typedef struct {
     size_t len;
 }StringView;
 
+#define SV_FMT "%.*s"
+#define SV_F(x) (int)(x).len, (x).start
+
 typedef struct {
     StringView* items;
     size_t count;
@@ -173,12 +176,20 @@ static print_cache(size_t* cache, size_t an, size_t bn) {
 }
 #endif // DEBUG
 
+size_t min3(size_t a, size_t b, size_t c) {
+    size_t n = a;
+    if (b < n) n = b;
+    if (c < n) n = c;
+    return n;
+}
+
 size_t levenshtein(const char* a, size_t an, const char* b, size_t bn) {
     if (an == 0) return bn;
     if (bn == 0) return an;
 
-    size_t* cache = calloc((an + 1) * (bn + 1), sizeof(size_t));
-#define CACHE_AT(i, j) cache[(i) * bn + (j)]
+    size_t cache[an + 1][bn + 1];
+    memset(cache, 0, (an + 1) * (bn + 1) * sizeof(cache[0][0]));
+#define CACHE_AT(i, j) cache[i][j]
 
     for (size_t j = 0; j <= bn; ++j) {
         CACHE_AT(0, j) = j;
@@ -191,16 +202,17 @@ size_t levenshtein(const char* a, size_t an, const char* b, size_t bn) {
     for (size_t i = 1; i <= an; ++i) {
         for (size_t j = 1; j <= bn; ++j) {
             size_t cost = a[i] == b[j]? 0 : 1;
-            CACHE_AT(i, j) = CACHE_AT(i - 1, j) + 1;
-            if (CACHE_AT(i, j - 1) + 1 < CACHE_AT(i, j)) CACHE_AT(i, j) = CACHE_AT(i, j - 1) + 1;
-            if (CACHE_AT(i - 1, j - 1) + cost < CACHE_AT(i, j)) CACHE_AT(i, j) = CACHE_AT(i - 1, j - 1) + cost;
+            CACHE_AT(i, j) = min3(CACHE_AT(i - 1, j) + 1, CACHE_AT(i, j - 1) + 1, CACHE_AT(i - 1, j - 1) + cost);
         }
     }
 
-    size_t value = cache[an * bn + bn];
-    free(cache);
+    size_t value = CACHE_AT(an, bn);
 
     return value;
+}
+
+size_t levenshtein_sv(StringView a, StringView b) {
+    return levenshtein(a.start, a.len, b.start, b.len);
 }
 
 char* read_entire_file(const char* path) {
@@ -225,13 +237,10 @@ typedef struct {
 }FuncDefDist;
 
 FuncDefDist query_exec(FuncDef* def, FuncDef query) {
-    size_t dist;
-    if (query.return_type.len == 1 && query.return_type.start[0] == '*') dist = 0;
-    else dist = levenshtein(def->return_type.start, def->return_type.len, query.return_type.start, query.return_type.len);
+    size_t dist = levenshtein_sv(def->return_type, query.return_type);
 
     for (size_t i = 0; i < def->param_types.count && i < query.param_types.count; ++i) {
-        if (query.param_types.items[i].len == 1 && query.param_types.items[i].start[0] == '*') continue;
-        dist += levenshtein(def->param_types.items[i].start, def->param_types.items[i].len, query.param_types.items[i].start, query.param_types.items[i].len);
+        dist += levenshtein_sv(def->param_types.items[i], query.param_types.items[i]);
     }
 
     for (size_t i = query.param_types.count; i < def->param_types.count; ++i) {
@@ -239,7 +248,6 @@ FuncDefDist query_exec(FuncDef* def, FuncDef query) {
     }
 
     for (size_t i = def->param_types.count; i < query.param_types.count; ++i) {
-        if (query.param_types.items[i].len == 1 && query.param_types.items[i].start[0] == '*') continue;
         dist += query.param_types.items[i].len;
     }
 
@@ -267,8 +275,8 @@ typedef struct {
 
 const char* pop_argv(int* argc, char*** argv) {
     const char* arg = **argv;
-    (*argv)++;
-    (*argc)--;
+    *argv += 1;
+    *argc -= 1;
     return arg;
 }
 
